@@ -47,6 +47,7 @@ pub fn backend(config: &luaux::Config) -> &'static dyn luaux::Backend {
     match config.backend {
         luaux::config::BackendKind::Table => &luaux::backend::Table,
         luaux::config::BackendKind::Element => &luaux::backend::Element,
+        luaux::config::BackendKind::Curried => &luaux::backend::Curried,
     }
 }
 
