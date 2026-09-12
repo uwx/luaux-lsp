@@ -759,7 +759,7 @@ impl Server {
             return;
         };
 
-        let arguments = proxy::arguments(&self.settings);
+        let arguments = proxy::arguments(&self.settings, self.primary_root().as_deref());
 
         match Proxy::spawn(&command, &arguments, self.events.clone()) {
             Ok(mut proxy) => {
@@ -1251,6 +1251,18 @@ impl Server {
     /// root of anything currently open — a file opened from outside every
     /// folder still belongs to a project, and its siblings are still worth
     /// compiling.
+    /// The first workspace root the editor reported at `initialize`, used to
+    /// resolve `luau-lsp.*` paths written relative to the project —
+    /// `types.definitionFiles` above all — the way `luau-lsp`'s own extension
+    /// resolves them client-side before they ever reach the binary.
+    fn primary_root(&self) -> Option<PathBuf> {
+        self.client
+            .pointer("/workspaceFolders/0/uri")
+            .and_then(Value::as_str)
+            .or_else(|| self.client.get("rootUri").and_then(Value::as_str))
+            .and_then(project::uri_to_path)
+    }
+
     fn workspace_roots(&mut self) -> Vec<PathBuf> {
         let mut roots: Vec<PathBuf> = Vec::new();
 

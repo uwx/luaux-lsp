@@ -281,25 +281,33 @@ fn is_executable(path: &Path) -> bool {
 /// Making people configure the same definition files twice is a bug, so these
 /// come from the settings the user already has for the luau-lsp extension
 /// rather than from settings of ours.
-pub fn arguments(settings: &Value) -> Vec<String> {
+///
+/// `workspace_root`, when known, resolves paths written relative to it —
+/// `luau-lsp`'s own extension does the same client-side before a path ever
+/// reaches the binary, and this proxy has no other cwd to resolve them
+/// against, since it never chdirs into the project itself.
+pub fn arguments(settings: &Value, workspace_root: Option<&Path>) -> Vec<String> {
     let mut arguments = vec!["--stdio".to_string()];
 
     // Roblox's own API types come first, as they do from the luau-lsp
-    // extension, so a user's own definitions layer on top of them.
+    // extension, so a user's own definitions layer on top of them. Already
+    // absolute — they come from `luau_lsp_storage`, not from a setting.
     let (definitions, documentation) = roblox_types(settings);
 
-    for path in definitions.into_iter().chain(strings(settings.pointer("/types/definitionFiles"))) {
-        arguments.push(format!("--definitions={path}"));
+    for (name, path) in
+        named("@roblox", definitions).chain(definition_files(settings.pointer("/types/definitionFiles")))
+    {
+        arguments.push(format!("--definitions:{name}={}", resolve(workspace_root, &path)));
     }
 
     for path in
         documentation.into_iter().chain(strings(settings.pointer("/types/documentationFiles")))
     {
-        arguments.push(format!("--docs={path}"));
+        arguments.push(format!("--docs={}", resolve(workspace_root, &path)));
     }
 
     if let Some(path) = settings.pointer("/platform/baseLuaurc").and_then(Value::as_str) {
-        arguments.push(format!("--base-luaurc={path}"));
+        arguments.push(format!("--base-luaurc={}", resolve(workspace_root, path)));
     }
 
     // Which flags are *on* is not a command-line matter — see [`fflags`].
@@ -308,6 +316,67 @@ pub fn arguments(settings: &Value) -> Vec<String> {
     }
 
     arguments
+}
+
+/// Joins a relative path onto the workspace root, the way `luau-lsp`'s own
+/// extension resolves `types.definitionFiles` et al. before passing them on —
+/// `luau-lsp.library/data/foo.d.luau` in settings.json means a path inside the
+/// project, not inside whatever directory this proxy happened to start in.
+/// An already-absolute path, or no known root, is still normalized but
+/// otherwise passes through unchanged.
+fn resolve(workspace_root: Option<&Path>, path: &str) -> String {
+    let candidate = Path::new(path);
+
+    let full = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        match workspace_root {
+            Some(root) => root.join(candidate),
+            None => candidate.to_path_buf(),
+        }
+    };
+
+    normalize(&full)
+}
+
+/// Settings written on any platform tend to use `/`, `luau-lsp`'s own
+/// convention even in its Windows docs. `Path::join` does not re-split a
+/// relative path's own separators, so joining one onto a native root (which
+/// uses `\` on Windows) prints both at once — `C:\root\a/b\c.d.luau` — and
+/// `luau-lsp` is handed a path mixing the two. Rebuilding through
+/// `components()`, which recognizes `/` as a separator on Windows even
+/// though it never writes one, normalizes everything to the platform's own.
+fn normalize(path: &Path) -> String {
+    path.components().collect::<PathBuf>().display().to_string()
+}
+
+/// `luau-lsp.types.definitionFiles` is a map of package name to path (the
+/// setting's current shape, e.g. `{"MyLib": "mylib.d.luau"}`) — luau-lsp
+/// itself still reads a bare array of paths too, for settings written before
+/// the setting changed shape, so both are accepted here. The package name
+/// matters to luau-lsp beyond bookkeeping: it becomes the definitions'
+/// chunkname, so a legacy array gets synthetic names distinct from Roblox's
+/// own `@roblox` entry above rather than colliding with it.
+fn definition_files(value: Option<&Value>) -> Vec<(String, String)> {
+    match value {
+        Some(Value::Object(map)) => map
+            .iter()
+            .filter_map(|(name, path)| path.as_str().map(|path| (name.clone(), path.to_string())))
+            .collect(),
+        Some(Value::Array(_)) => named("@user", strings(value)).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Numbers entries past the first, the way luau-lsp itself names unlabelled
+/// definition files passed without a package name (`@roblox`, `@roblox1`,
+/// `@roblox2`, ...).
+fn named(prefix: &str, paths: impl IntoIterator<Item = String>) -> impl Iterator<Item = (String, String)> {
+    let prefix = prefix.to_string();
+    paths.into_iter().enumerate().map(move |(i, path)| {
+        let name = if i == 0 { prefix.clone() } else { format!("{prefix}{}", i + 1) };
+        (name, path)
+    })
 }
 
 /// Flag names carry a type prefix in Roblox's own tables that luau-lsp does not
@@ -477,26 +546,150 @@ mod tests {
 
     #[test]
     fn settings_become_command_line_arguments() {
+        // The setting's current shape: a map of package name to path, exactly
+        // as `luau-lsp`'s own extension writes it.
         let settings = json!({
             "types": {
-                "definitionFiles": ["/defs/globalTypes.d.luau", "/defs/testez.d.luau"],
+                "definitionFiles": {
+                    "globalTypes": "/defs/globalTypes.d.luau",
+                    "testez": "/defs/testez.d.luau",
+                },
                 "documentationFiles": ["/docs/api.json"],
             },
             "platform": { "baseLuaurc": "/p/.luaurc" },
         });
 
-        let arguments = arguments(&settings);
+        let arguments = arguments(&settings, None);
         assert!(arguments.contains(&"--stdio".to_string()));
-        assert!(arguments.contains(&"--definitions=/defs/globalTypes.d.luau".to_string()));
-        assert!(arguments.contains(&"--definitions=/defs/testez.d.luau".to_string()));
-        assert!(arguments.contains(&"--docs=/docs/api.json".to_string()));
-        assert!(arguments.contains(&"--base-luaurc=/p/.luaurc".to_string()));
+        assert!(arguments.contains(&format!(
+            "--definitions:globalTypes={}",
+            normalize(Path::new("/defs/globalTypes.d.luau"))
+        )));
+        assert!(arguments
+            .contains(&format!("--definitions:testez={}", normalize(Path::new("/defs/testez.d.luau")))));
+        assert!(arguments.contains(&format!("--docs={}", normalize(Path::new("/docs/api.json")))));
+        assert!(arguments.contains(&format!("--base-luaurc={}", normalize(Path::new("/p/.luaurc")))));
+    }
+
+    /// `types.definitionFiles` entries can depend on one another (one
+    /// declaring types the next one uses), so `luau-lsp` has to load them in
+    /// the order the user wrote them — not, say, alphabetically by package
+    /// name. `serde_json::Map` sorts by key unless `preserve_order` is on,
+    /// which is exactly the bug this guards: settings.json's own declaration
+    /// order has to survive all the way to the CLI arguments.
+    #[test]
+    fn definition_files_keep_the_order_they_were_declared_in() {
+        let settings = json!({
+            "types": {
+                "definitionFiles": {
+                    "globals": "globals.d.luau",
+                    "NFMWorldLibrary": "lib.d.luau",
+                    "NFMWorld": "world.d.luau",
+                    "exports": "exports.d.luau",
+                },
+            },
+        });
+
+        let built = arguments(&settings, None);
+        let names: Vec<&str> = built
+            .iter()
+            .filter_map(|argument| argument.strip_prefix("--definitions:"))
+            .map(|entry| entry.split('=').next().unwrap())
+            .filter(|name| !name.starts_with("@roblox"))
+            .collect();
+
+        assert_eq!(names, ["globals", "NFMWorldLibrary", "NFMWorld", "exports"]);
+    }
+
+    /// Settings written before `types.definitionFiles` changed shape from a
+    /// bare array of paths to a map of package name to path. `luau-lsp` itself
+    /// still accepts the array, so this proxy has to as well rather than
+    /// silently dropping every file in it.
+    #[test]
+    fn a_legacy_definition_files_array_is_still_forwarded() {
+        let arguments = arguments(
+            &json!({
+                "types": { "definitionFiles": ["/defs/globalTypes.d.luau", "/defs/testez.d.luau"] },
+            }),
+            None,
+        );
+
+        assert!(arguments.contains(&format!(
+            "--definitions:@user={}",
+            normalize(Path::new("/defs/globalTypes.d.luau"))
+        )));
+        assert!(arguments.contains(&format!(
+            "--definitions:@user2={}",
+            normalize(Path::new("/defs/testez.d.luau"))
+        )));
+    }
+
+    /// A relative `types.definitionFiles` path is resolved against the
+    /// workspace root, the way `luau-lsp`'s own extension resolves it
+    /// client-side before the binary ever sees it — this proxy has no other
+    /// cwd to resolve it against.
+    #[test]
+    fn a_relative_definition_file_is_resolved_against_the_workspace_root() {
+        let root = Path::new("/project");
+        let settings = json!({
+            "types": { "definitionFiles": { "mine": "declarations/mine.d.luau" } },
+            "platform": { "baseLuaurc": "base/.luaurc" },
+        });
+
+        let resolved = arguments(&settings, Some(root));
+        let expected_definitions =
+            format!("--definitions:mine={}", normalize(&root.join("declarations/mine.d.luau")));
+        let expected_luaurc =
+            format!("--base-luaurc={}", normalize(&root.join("base/.luaurc")));
+
+        assert!(resolved.contains(&expected_definitions), "{resolved:?}");
+        assert!(resolved.contains(&expected_luaurc), "{resolved:?}");
+
+        // Nothing to resolve against without a known root: normalized, but
+        // otherwise passed through as-is.
+        let expected_without_root =
+            format!("--definitions:mine={}", normalize(Path::new("declarations/mine.d.luau")));
+        assert!(arguments(&settings, None).contains(&expected_without_root));
+    }
+
+    /// `settings.json` entries are written with `/` even on Windows (it's
+    /// `luau-lsp`'s own convention), and joining one straight onto a native
+    /// root would otherwise hand `luau-lsp` a path mixing `\` and `/`.
+    #[test]
+    #[cfg(windows)]
+    fn a_relative_definition_file_gets_native_separators_on_windows() {
+        let resolved = arguments(
+            &json!({ "types": { "definitionFiles": { "mine": "a/b/c.d.luau" } } }),
+            Some(Path::new(r"C:\project")),
+        );
+
+        assert!(
+            resolved.contains(&r"--definitions:mine=C:\project\a\b\c.d.luau".to_string()),
+            "{resolved:?}"
+        );
+    }
+
+    /// An already-absolute path is never rewritten onto the workspace root,
+    /// even when one is known.
+    #[test]
+    fn an_absolute_definition_file_is_left_alone() {
+        #[cfg(windows)]
+        let absolute = r"C:\abs\mine.d.luau";
+        #[cfg(not(windows))]
+        let absolute = "/abs/mine.d.luau";
+
+        let arguments = arguments(
+            &json!({ "types": { "definitionFiles": { "mine": absolute } } }),
+            Some(Path::new("/project")),
+        );
+
+        assert!(arguments.contains(&format!("--definitions:mine={absolute}")), "{arguments:?}");
     }
 
     /// Everything but the Roblox globals, which depend on what this machine has
     /// downloaded and are covered separately.
     fn without_roblox_types(settings: Value) -> Vec<String> {
-        arguments(&settings)
+        arguments(&settings, None)
             .into_iter()
             .filter(|argument| !argument.contains("globalTypes.") && !argument.contains("api-docs"))
             .collect()
@@ -548,22 +741,28 @@ mod tests {
             return;
         };
 
-        let arguments = arguments(&json!({
-            "types": { "definitionFiles": ["/mine/extra.d.luau"] },
-        }));
+        let arguments = arguments(
+            &json!({
+                "types": { "definitionFiles": { "mine": "/mine/extra.d.luau" } },
+            }),
+            None,
+        );
         let definitions: Vec<&String> =
-            arguments.iter().filter(|a| a.starts_with("--definitions=")).collect();
+            arguments.iter().filter(|a| a.starts_with("--definitions:")).collect();
 
         // Theirs first, so a project's own definitions layer on top rather than
         // being buried under Roblox's.
         assert!(definitions.len() >= 2, "{definitions:?}");
         assert!(definitions[0].contains("globalTypes."), "{definitions:?}");
-        assert!(definitions.last().unwrap().ends_with("/mine/extra.d.luau"), "{definitions:?}");
+        assert!(
+            definitions.last().unwrap().ends_with(&normalize(Path::new("/mine/extra.d.luau"))),
+            "{definitions:?}"
+        );
     }
 
     #[test]
     fn flags_being_off_by_default_is_passed_through() {
-        let arguments = arguments(&json!({ "fflags": { "enableByDefault": false } }));
+        let arguments = arguments(&json!({ "fflags": { "enableByDefault": false } }), None);
         assert!(arguments.contains(&"--no-flags-enabled".to_string()));
     }
 
