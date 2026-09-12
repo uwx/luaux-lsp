@@ -107,6 +107,75 @@
           ],
           "default": "off",
           "description": "Log traffic between the editor and the LuauX server."
+        },
+        "luau-lsp.types.definitionFiles": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "markdownDescription": "A mapping of package names to paths of extra type definition files, forwarded to the `luau-lsp` this extension runs for `.luaux` files. Declared here so it works without the `luau-lsp` extension installed; Roblox's own definitions still come first, with these layered on top. A bare array of paths (the setting's old shape) is still accepted."
+        },
+        "luau-lsp.types.documentationFiles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Extra documentation files for hover, forwarded to the `luau-lsp` this extension runs for `.luaux` files."
+        },
+        "luau-lsp.types.roblox": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Load Roblox API types (`game`, `workspace`, and so on) into the `luau-lsp` this extension runs. Turn off for a non-Roblox project."
+        },
+        "luau-lsp.types.robloxSecurityLevel": {
+          "type": "string",
+          "enum": [
+            "None",
+            "PluginSecurity",
+            "LocalUserSecurity",
+            "RobloxScriptSecurity"
+          ],
+          "default": "PluginSecurity",
+          "markdownDescription": "Which Roblox API security level's globals to load. Falls back to whichever level `#luau-lsp.types.definitionFiles#`'s downloader has on disk if this exact one is missing."
+        },
+        "luau-lsp.platform.type": {
+          "type": "string",
+          "enum": [
+            "roblox",
+            "standard"
+          ],
+          "default": "roblox",
+          "markdownDescription": "Set to `standard` for a non-Roblox project, so `game` and `workspace` are not assumed to exist."
+        },
+        "luau-lsp.platform.baseLuaurc": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to a `.luaurc` whose settings apply as a base to every file, forwarded to the `luau-lsp` this extension runs."
+        },
+        "luau-lsp.fflags.enableByDefault": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Whether Luau feature flags default to on in the `luau-lsp` this extension runs. Off means only flags explicitly named in `#luau-lsp.fflags.override#` are enabled."
+        },
+        "luau-lsp.fflags.enableNewSolver": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Enable Luau's new type solver. Needed for types written with `keyof<>` or user-defined type functions — without it those resolve to an error type."
+        },
+        "luau-lsp.fflags.override": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "markdownDescription": "Explicit Luau feature flag values (e.g. `{ \"LuauSolverV2\": \"true\" }`), forwarded to the `luau-lsp` this extension runs. Wins over `#luau-lsp.fflags.sync#`'s fetched values."
+        },
+        "luau-lsp.fflags.sync": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Fetch Roblox's current Luau flag values and pass them to the `luau-lsp` this extension runs, so `.luaux` gets the same answers as the `.luau` it compiles to."
         }
       }
     },
