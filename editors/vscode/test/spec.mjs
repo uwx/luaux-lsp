@@ -61,6 +61,16 @@ scoped("shorthand attribute", 'local e = <Frame Visible />', "Visible", "entity.
 scoped("attribute expression is luau", 'local e = <Frame Size={UDim2.new()}/>', "UDim2", "");
 notScoped("attribute expression is not text", 'local e = <Frame Size={x}/>', "x", "string.unquoted");
 
+// --- generic instantiation on the tag itself: `<Sx.For<<T>> each={...}>` ---
+// (Luau's own `<<...>>` explicit-instantiation syntax, lexer.rs:60-64 on the
+// compiler side.) The element must still open as markup, the generic's own
+// `>>` must not be mistaken for the tag's closing `>`, and whatever follows
+// the generic must still be parsed as a real attribute, not leftover text.
+scoped("a tag with a generic still opens", "local e = <Sx.For<<T>> each={x}></Sx.For>", "Sx.For", "entity.name.tag");
+scoped("the generic's own >> is not the tag's close", "local e = <Sx.For<<T>> each={x}></Sx.For>", ">>", "punctuation.definition.typeparameters.end");
+scoped("an attribute after a generic is still an attribute", "local e = <Sx.For<<T>> each={x}></Sx.For>", "each", "entity.other.attribute-name");
+scoped("a union/table generic argument still closes the tag", 'local e = <Sx.For<<A | { id: string }>> each={x}></Sx.For>', "each", "entity.other.attribute-name");
+
 // --- text: the apostrophe case ---
 scoped("text content", "local e = <TextLabel>don't</TextLabel>", "don't", "string.unquoted");
 notScoped("apostrophe does not open a luau string", "local e = <TextLabel>don't</TextLabel>\nlocal after = 1", "after", "string");

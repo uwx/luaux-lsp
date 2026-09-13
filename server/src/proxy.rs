@@ -306,8 +306,13 @@ pub fn arguments(settings: &Value, workspace_root: Option<&Path>) -> Vec<String>
         arguments.push(format!("--docs={}", resolve(workspace_root, &path)));
     }
 
+    // Empty string is `luau-lsp`'s own extension's default for "unset", not a
+    // path — passing it through verbatim resolves to the bare workspace root,
+    // which `luau-lsp` then fails to read as a `.luaurc` file and exits.
     if let Some(path) = settings.pointer("/platform/baseLuaurc").and_then(Value::as_str) {
-        arguments.push(format!("--base-luaurc={}", resolve(workspace_root, path)));
+        if !path.is_empty() {
+            arguments.push(format!("--base-luaurc={}", resolve(workspace_root, path)));
+        }
     }
 
     // Which flags are *on* is not a command-line matter — see [`fflags`].
@@ -569,6 +574,18 @@ mod tests {
             .contains(&format!("--definitions:testez={}", normalize(Path::new("/defs/testez.d.luau")))));
         assert!(arguments.contains(&format!("--docs={}", normalize(Path::new("/docs/api.json")))));
         assert!(arguments.contains(&format!("--base-luaurc={}", normalize(Path::new("/p/.luaurc")))));
+    }
+
+    /// `luau-lsp`'s own extension writes `""` for `platform.baseLuaurc` when
+    /// the user has never set it — not absent, an empty string. Passing that
+    /// through resolved to the bare workspace root, which `luau-lsp` then
+    /// failed to read as a `.luaurc` file and exited on every launch.
+    #[test]
+    fn an_empty_base_luaurc_is_treated_as_unset() {
+        let settings = json!({ "platform": { "baseLuaurc": "" } });
+
+        let arguments = arguments(&settings, Some(Path::new("/p")));
+        assert!(!arguments.iter().any(|a| a.starts_with("--base-luaurc")), "{arguments:?}");
     }
 
     /// `types.definitionFiles` entries can depend on one another (one

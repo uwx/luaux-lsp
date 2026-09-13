@@ -173,6 +173,24 @@ fn unique_match(haystack: &str, needle: &str) -> Option<usize> {
     (!haystack[at + needle.len()..].contains(needle)).then_some(at)
 }
 
+/// Where a tag's own `<<...>>` generic instantiation sits in `source`, if
+/// `name_end` (right after the tag name) is followed by one — trimmed the
+/// same way the parser trims it (`markup/parser.rs::parse_generic_instantiation`)
+/// before handing it to the backend, so the returned span's length matches
+/// `element.generics`'s exactly and lines up with what the backend spliced
+/// into the output verbatim.
+fn generics_span(source: &str, name_end: usize) -> Option<(usize, usize)> {
+    if !source.get(name_end..)?.starts_with("<<") {
+        return None;
+    }
+
+    let close = luaux::lexer::find_matching_generic_close(source, name_end).ok()?;
+    let raw = source.get(name_end + 2..close - 1)?;
+    let start = name_end + 2 + (raw.len() - raw.trim_start().len());
+
+    Some((start, start + raw.trim().len()))
+}
+
 /// Where the generated region ending at `source_end` stops in the output.
 ///
 /// Everything after a region on its final line is copied verbatim, so the output
@@ -509,46 +527,69 @@ impl Builder<'_> {
         true
     }
 
-    /// Records a component's tag name, which is emitted as the call it becomes.
+    /// Records a component's tag name, which is emitted as the call it becomes,
+    /// and — when the tag carries one (`<Row<<T>> .../>`) — its generic
+    /// instantiation right after, which `backend/common.rs::callee` splices in
+    /// verbatim as Luau's own `<<...>>` syntax. Mapping the generic argument is
+    /// what lets hover reach a type referenced inside it; without a run there,
+    /// nothing forwards that position to `luau-lsp` at all.
     ///
-    /// Searched as `Row(` rather than as `Row`, because a bare name is far too
-    /// easy to find twice and an ambiguous search records nothing at all:
-    /// `<TextLabel><Label/></TextLabel>` has one inside the string
-    /// `"TextLabel"`, which costs the whole feature for that element.
+    /// Searched as `Row(` (or `Row<<T>>(` with a generic) rather than as `Row`,
+    /// because a bare name is far too easy to find twice and an ambiguous
+    /// search records nothing at all: `<TextLabel><Label/></TextLabel>` has one
+    /// inside the string `"TextLabel"`, which costs the whole feature for that
+    /// element.
     ///
     /// Uniqueness is still required even so. Emission is in source order, so the
     /// *first* match is nearly always the right one — and "nearly always" is
     /// exactly what decision 6 refuses. An attribute whose value happens to
     /// contain `Row(`, on an element whose own name did not map, would put the
     /// run on text the author never wrote.
-    fn component_name(&mut self, source_start: usize, name: &str) -> bool {
+    fn component_name(&mut self, source_start: usize, name: &str, generics: Option<(usize, &str)>) -> bool {
         if name.is_empty() || self.source.get(source_start..source_start + name.len()) != Some(name)
         {
             return false;
         }
 
-        let needle = format!("{name}(");
+        let needle = match generics {
+            Some((_, text)) => format!("{name}<<{text}>>("),
+            None => format!("{name}("),
+        };
 
-        if self.output.get(self.cursor..self.limit).is_some_and(|rest| rest.starts_with(&needle)) {
-            return self.record(source_start, self.cursor, name.len());
-        }
-
-        // Bounded to the tag's own line first, so a component used twice is not
-        // ambiguous with itself; then the region, for the same reason
-        // [`Builder::verbatim`] falls back.
-        if let Some(at) = self
+        let mapped = if self
+            .output
+            .get(self.cursor..self.limit)
+            .is_some_and(|rest| rest.starts_with(&needle))
+        {
+            self.record(source_start, self.cursor, name.len())
+        } else if let Some(at) = self
             .window(source_start, name.len())
             .and_then(|(from, to)| Some((from, unique_match(self.output.get(from..to)?, &needle)?)))
         {
-            return self.record(source_start, at.0 + at.1, name.len());
+            // Bounded to the tag's own line first, so a component used twice is
+            // not ambiguous with itself; then the region, for the same reason
+            // [`Builder::verbatim`] falls back.
+            self.record(source_start, at.0 + at.1, name.len())
+        } else if let Some(rest) = self.output.get(self.cursor..self.limit) {
+            match unique_match(rest, &needle) {
+                Some(at) => self.record(source_start, self.cursor + at, name.len()),
+                None => self.lose(),
+            }
+        } else {
+            self.lose()
+        };
+
+        // The name's own run just left the cursor sitting right on `<<`, so the
+        // generic argument's text is exactly where `expression` expects to find
+        // it — verbatim, immediately ahead.
+        if mapped {
+            if let Some((generic_start, text)) = generics {
+                self.anchor_before("<<", generic_start);
+                self.expression(generic_start, generic_start + text.len());
+            }
         }
 
-        let Some(rest) = self.output.get(self.cursor..self.limit) else { return self.lose() };
-
-        match unique_match(rest, &needle) {
-            Some(at) => self.record(source_start, self.cursor + at, name.len()),
-            None => self.lose(),
-        }
+        mapped
     }
 
     /// Steps over `Key = `, recording the key itself when the author wrote it.
@@ -634,8 +675,12 @@ impl Builder<'_> {
         // saying nothing, and worse than the answer we give ourselves.
         if intrinsic.is_none() {
             let written = element.name.as_written();
-            let (start, _) = crate::tree::open_name(self.source, element.span.start, &written);
-            self.component_name(start, &written);
+            let (start, name_end) = crate::tree::open_name(self.source, element.span.start, &written);
+            let generics = element
+                .generics
+                .as_deref()
+                .and_then(|text| generics_span(self.source, name_end).map(|(start, _)| (start, text)));
+            self.component_name(start, &written, generics);
         } else if let Some(class) = &intrinsic {
             // Step onto this element's own output before anything inside it is
             // placed. A component's name did that above; an intrinsic emits no
@@ -1393,6 +1438,35 @@ end
         let at = source.find("<Label/>").expect("tag") + 1;
         let to = map.to_output(at).expect("the component name maps");
         assert_eq!(&output[to..to + 5], "Label");
+    }
+
+    /// A tag's generic instantiation is emitted verbatim right after its own
+    /// name (`backend/common.rs::callee`), so both the name and the type it
+    /// carries get a run — the same coverage a plain `<Row/>` already has,
+    /// extended to what is effectively a second identifier position.
+    #[test]
+    fn a_tag_with_a_generic_maps_the_name_and_the_generic() {
+        let source =
+            "local create = f()\nlocal Row = f()\nlocal e = <Row<<CarData>> each={x}/>\n";
+        let (output, map, _) = compiled(source);
+        assert_round_trips(source, &output, &map);
+
+        assert_eq!(maps_to(source, &output, &map, "Row"), Some("Row"));
+        assert_eq!(maps_to(source, &output, &map, "CarData"), Some("CarData"));
+    }
+
+    /// The generic argument is captured verbatim, whitespace and all, so a
+    /// union of an anonymous table type — the shape that first exposed the
+    /// missing hover — still lines up byte for byte.
+    #[test]
+    fn a_union_table_generic_argument_still_maps() {
+        let source = "local create = f()\nlocal Row = f()\n\
+            local e = <Row<<A | { id: string }>> each={x}/>\n";
+        let (output, map, _) = compiled(source);
+        assert_round_trips(source, &output, &map);
+
+        assert_eq!(maps_to(source, &output, &map, "Row"), Some("Row"));
+        assert_eq!(maps_to(source, &output, &map, "id: string"), Some("id: string"));
     }
 
     /// Two of the same component in one region cannot be told apart by a search,
