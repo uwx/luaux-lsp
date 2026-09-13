@@ -287,9 +287,16 @@ impl Server {
             | "textDocument/references"
             | "textDocument/signatureHelp"
             | "textDocument/documentHighlight"
-            | "textDocument/inlayHint"
             | "textDocument/foldingRange"
             | "textDocument/selectionRange" => self.forward(id, method, params, None, false),
+
+            // Not `forward`: its `range` is the visible viewport, which almost
+            // always straddles more than one verbatim run, so mapping it down
+            // as one contiguous span fails outright on any file with markup in
+            // it. Asking about the whole generated file instead is harmless —
+            // the response is filtered hint by hint on the way back — and it is
+            // what actually gets hints to show up in a `.luaux`.
+            "textDocument/inlayHint" => self.inlay_hint(id, params),
 
             _ => self.error(id, METHOD_NOT_FOUND, &format!("{method} is not supported")),
         }
@@ -1077,6 +1084,73 @@ impl Server {
             Err(error) => {
                 self.log(1, &format!("luau-lsp: {error}"));
                 self.reply(id, merged(ours, Value::Null));
+            }
+        }
+    }
+
+    /// Forwards an inlay hint request over the whole generated file, rather
+    /// than the requested range.
+    ///
+    /// [`Server::forward`] would map that range down with [`Remap::message`],
+    /// which requires both edges to land in the same verbatim run — a
+    /// constraint built for a location that ends up on screen, where landing
+    /// on the wrong text is worse than landing on none. A viewport is not
+    /// that: it names nothing the user will see, only how much of the file to
+    /// ask about, and it routinely spans several runs, so mapping it that way
+    /// makes the whole request unmappable in any `.luaux` with more than one
+    /// piece of markup. Asking about the whole file instead costs nothing —
+    /// each hint in the answer is still mapped, and dropped, individually —
+    /// and it is what makes hints appear at all.
+    fn inlay_hint(&mut self, id: Value, params: Value) {
+        let Some(uri) = params.pointer("/textDocument/uri").and_then(Value::as_str) else {
+            self.reply(id, Value::Null);
+            return;
+        };
+        let uri = uri.to_string();
+
+        let (Some(generated), Some(compiled)) =
+            (self.generated_uri(&uri), self.compiled.get(&uri))
+        else {
+            self.reply(id, Value::Null);
+            return;
+        };
+
+        let end = LineIndex::new(&compiled.output).position(&compiled.output, compiled.output.len());
+        let mapped = json!({
+            "textDocument": { "uri": generated },
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": end.line, "character": end.character },
+            },
+        });
+
+        if !self.child_ready {
+            self.reply(id, Value::Null);
+            return;
+        }
+
+        if self
+            .generated_uri(&uri)
+            .is_some_and(|generated| !self.opened_in_child.contains(&generated))
+        {
+            self.sync_child(&uri);
+        }
+
+        let Some(proxy) = &mut self.proxy else {
+            self.reply(id, Value::Null);
+            return;
+        };
+
+        match proxy.request("textDocument/inlayHint", mapped) {
+            Ok(child_id) => {
+                self.pending.insert(
+                    child_id,
+                    Pending::Editor { id, uri, ours: None, all_or_nothing: false },
+                );
+            }
+            Err(error) => {
+                self.log(1, &format!("luau-lsp: {error}"));
+                self.reply(id, Value::Null);
             }
         }
     }
