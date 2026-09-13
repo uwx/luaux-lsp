@@ -73,7 +73,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       trace === "off" ? undefined : vscode.window.createOutputChannel("LuauX Trace"),
     // Handed on to luau-lsp by the server, which layers the user's own
     // `luau-lsp.fflags.*` settings over them.
-    initializationOptions: { fflags: await syncedFFlags(output) },
+    initializationOptions: { fflags: await syncedFFlags(output, context) },
   };
 
   client = new LanguageClient("luaux", "LuauX", serverOptions, clientOptions);
@@ -202,10 +202,23 @@ const FLAG_PREFIXES = ["FFlag", "FInt", "DFFlag", "DFInt"];
 /// is *said*, because the symptom otherwise is Vide's `create` typed as
 /// `*error-type*` with nothing anywhere explaining why. luau-lsp's own extension
 /// says the same thing for the same condition.
-async function syncedFFlags(output: vscode.OutputChannel): Promise<Record<string, string>> {
+///
+/// A failed fetch falls back to whatever was last fetched successfully, kept in
+/// `context.globalState` — a transient network hiccup on this one activation
+/// otherwise threw away flags that were fine a minute ago, which is a worse
+/// answer than the stale-but-still-mostly-right one already on disk. Only the
+/// very first activation with no connectivity ever sees a truly empty set.
+const FFLAGS_CACHE_KEY = "luaux.fflags.cache";
+
+async function syncedFFlags(
+  output: vscode.OutputChannel,
+  context: vscode.ExtensionContext,
+): Promise<Record<string, string>> {
   if (!vscode.workspace.getConfiguration("luau-lsp.fflags").get<boolean>("sync", true)) {
     return {};
   }
+
+  const cached = context.globalState.get<Record<string, string>>(FFLAGS_CACHE_KEY, {});
 
   let published: Record<string, unknown>;
 
@@ -219,9 +232,11 @@ async function syncedFFlags(output: vscode.OutputChannel): Promise<Record<string
     // answers and better ones, not between working and not.
     output.appendLine(
       `could not fetch Luau FFlags (${error instanceof Error ? error.message : error}); ` +
-        "continuing without them, so types needing a newer Luau solver may not resolve",
+        (Object.keys(cached).length > 0
+          ? "continuing with the last successfully fetched flags"
+          : "continuing without them, so types needing a newer Luau solver may not resolve"),
     );
-    return {};
+    return cached;
   }
 
   const flags: Record<string, string> = {};
@@ -235,6 +250,7 @@ async function syncedFFlags(output: vscode.OutputChannel): Promise<Record<string
     }
   }
 
+  await context.globalState.update(FFLAGS_CACHE_KEY, flags);
   return flags;
 }
 

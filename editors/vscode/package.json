@@ -34,10 +34,7 @@
       {
         "language": "luaux",
         "scopeName": "source.luaux",
-        "path": "./syntaxes/luaux.tmLanguage.json",
-        "embeddedLanguages": {
-          "meta.embedded.block.luau": "luau"
-        }
+        "path": "./syntaxes/luaux.tmLanguage.json"
       },
       {
         "scopeName": "luaux.injection",

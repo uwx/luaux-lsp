@@ -63,7 +63,7 @@
     "element": {
       "name": "meta.tag.luaux",
       "comment": "The element consumes its own `/>`, and the attribute section stops *before* it. An earlier version had attributes consume `/>` and ended the element on a zero-width `(?<=/>)` lookbehind \u2014 which a self-closing *child* also satisfied, silently closing the parent and leaving its real closing tag unmatched.",
-      "begin": "(<)([_A-Za-z][_A-Za-z0-9]*(?:\\.[_A-Za-z0-9]+)*)(?=[\\s/>])",
+      "begin": "(<)([_A-Za-z][_A-Za-z0-9]*(?:\\.[_A-Za-z0-9]+)*)(?=[\\s/>]|<<)",
       "beginCaptures": {
         "1": {
           "name": "punctuation.definition.tag.begin.luaux"
@@ -255,15 +255,42 @@
       },
       "patterns": [
         {
+          "include": "#generics"
+        },
+        {
           "include": "#attribute"
         }
       ],
-      "comment": "`\\G` anchors to where the tag name ended, so this only runs for *this* element's attributes; without it a nested `<Tag` matched here instead of opening its own block. Ends before `/>` so the element can consume it."
+      "comment": "`\\G` anchors to where the tag name ended, so this only runs for *this* element's attributes; without it a nested `<Tag` matched here instead of opening its own block. Ends before `/>` so the element can consume it. `#generics` is tried first because a generic instantiation, when present, comes before any real attribute (`<Sx.For<<T>> each={x}>`) — it cannot be a sibling of `attributes` gated by its own `\\G`, since `\\G` anchors to *this frame's* entry point, fixed once when `attributes` opens; a second `\\G`-gated rule tried after `attributes` had already consumed characters could never fire again."
+    },
+    "generics": {
+      "begin": "(<<)",
+      "beginCaptures": {
+        "1": {
+          "name": "punctuation.definition.typeparameters.begin.luaux"
+        }
+      },
+      "end": "(>>)",
+      "endCaptures": {
+        "1": {
+          "name": "punctuation.definition.typeparameters.end.luaux"
+        }
+      },
+      "name": "meta.type.parameters.luaux",
+      "patterns": [
+        {
+          "include": "source.luau#comment"
+        },
+        {
+          "include": "source.luau#type_literal"
+        }
+      ],
+      "comment": "`<Sx.For<<T>> each={...}>` — an explicit generic instantiation (Luau's own `identity<<number>>(1)` syntax, lexer.rs:60-64 on the compiler side) right after the tag name. Without this rule, `element`/`elementEnteringMarkup` never even opens — their lookahead only allowed whitespace, `/` or `>` right after the name — so the whole tag fell through to being tokenized as plain Luau, and anything after the generic (like `each=`) was highlighted as if it were still inside a Luau type expression instead of an attribute. Included from `attributes` rather than `\\G`-gated itself: it only ever needs to match right where `attributes` starts looking, and `attributes` already owns the one `\\G` check for this element. The body delegates to Luau's own `generics-instantiation` rule (`#type_literal`) rather than re-implementing bracket balancing for nested generics/table types — that rule already gets `Map<string, Array<number>>` and `{ id: string }` right."
     },
     "elementEnteringMarkup": {
       "name": "meta.tag.luaux",
       "comment": "Identical to `element` but for the lookbehind, which is what makes a `<` an opening tag rather than a comparison or a type argument. It belongs *here* and not on `element` itself: this rule is how markup is entered from Luau, where `Source<T>` and `a<b` are the things to keep out. Between children the character before a `<` is ordinary text, and guarding there stops `<TextLabel>Hi<Row/></TextLabel>` \u2014 the child's `/>` then closes the parent, which is the exact failure `element`'s own comment describes. `entering_markup_matches_the_shared_rule` in the grammar tests keeps the two from drifting.",
-      "begin": "(?<![_A-Za-z0-9)\\]])(<)([_A-Za-z][_A-Za-z0-9]*(?:\\.[_A-Za-z0-9]+)*)(?=[\\s/>])",
+      "begin": "(?<![_A-Za-z0-9)\\]])(<)([_A-Za-z][_A-Za-z0-9]*(?:\\.[_A-Za-z0-9]+)*)(?=[\\s/>]|<<)",
       "beginCaptures": {
         "1": {
           "name": "punctuation.definition.tag.begin.luaux"

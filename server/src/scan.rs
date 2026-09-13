@@ -250,6 +250,23 @@ impl<'a> State<'a> {
             return at.max(from + 1);
         }
 
+        // A generic instantiation right after the name: `<Sx.For<<T>> …>`.
+        // Without this, the loop below sees the first `>` of the closing
+        // `>>` and concludes the *tag* has closed there, leaving the second
+        // `>` — and everything the generic argument contains, unions and
+        // table types included — to corrupt the context computed for the
+        // rest of the tag (no hover inside `<<...>>`, wrong attribute
+        // parsing after it).
+        if self.source[at..to].starts_with("<<") {
+            match luaux::lexer::find_matching_generic_close(self.source, at) {
+                Ok(close) => at = close + 1,
+                // Unbalanced — most likely still being typed. Nothing past
+                // this point can be trusted as a tag/attribute anyway, so
+                // stop scanning rather than guess.
+                Err(_) => return to,
+            }
+        }
+
         loop {
             if at >= to {
                 // Unclosed. Everything after the name is still inside this tag —
