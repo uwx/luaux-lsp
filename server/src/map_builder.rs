@@ -534,11 +534,17 @@ impl Builder<'_> {
     /// what lets hover reach a type referenced inside it; without a run there,
     /// nothing forwards that position to `luau-lsp` at all.
     ///
-    /// Searched as `Row(` (or `Row<<T>>(` with a generic) rather than as `Row`,
-    /// because a bare name is far too easy to find twice and an ambiguous
-    /// search records nothing at all: `<TextLabel><Label/></TextLabel>` has one
-    /// inside the string `"TextLabel"`, which costs the whole feature for that
-    /// element.
+    /// Searched as `Row(` rather than as `Row`, because a bare name is far too
+    /// easy to find twice and an ambiguous search records nothing at all:
+    /// `<TextLabel><Label/></TextLabel>` has one inside the string
+    /// `"TextLabel"`, which costs the whole feature for that element. But what
+    /// follows the name is not the same everywhere: the `Table` backend calls a
+    /// component directly (`Row(`), `Element` passes it as `create`'s first
+    /// argument (`Row,`), and `Curried` calls `create` with it before currying
+    /// (`Row)(`) — three different characters for the same reference. Rather
+    /// than plumb which backend is in play through here, every plausible one is
+    /// tried in turn; only the one that actually occurs in this compile's
+    /// output can ever match.
     ///
     /// Uniqueness is still required even so. Emission is in source order, so the
     /// *first* match is nearly always the right one — and "nearly always" is
@@ -551,32 +557,37 @@ impl Builder<'_> {
             return false;
         }
 
-        let needle = match generics {
-            Some((_, text)) => format!("{name}<<{text}>>("),
-            None => format!("{name}("),
+        let base = match generics {
+            Some((_, text)) => format!("{name}<<{text}>>"),
+            None => name.to_string(),
         };
 
-        let mapped = if self
-            .output
-            .get(self.cursor..self.limit)
-            .is_some_and(|rest| rest.starts_with(&needle))
-        {
-            self.record(source_start, self.cursor, name.len())
-        } else if let Some(at) = self
-            .window(source_start, name.len())
-            .and_then(|(from, to)| Some((from, unique_match(self.output.get(from..to)?, &needle)?)))
-        {
+        const FOLLOWED_BY: [char; 3] = ['(', ',', ')'];
+
+        let mapped = FOLLOWED_BY.iter().find_map(|suffix| {
+            let needle = format!("{base}{suffix}");
+
+            if self.output.get(self.cursor..self.limit).is_some_and(|rest| rest.starts_with(&needle)) {
+                return Some(self.record(source_start, self.cursor, name.len()));
+            }
+
             // Bounded to the tag's own line first, so a component used twice is
             // not ambiguous with itself; then the region, for the same reason
             // [`Builder::verbatim`] falls back.
-            self.record(source_start, at.0 + at.1, name.len())
-        } else if let Some(rest) = self.output.get(self.cursor..self.limit) {
-            match unique_match(rest, &needle) {
-                Some(at) => self.record(source_start, self.cursor + at, name.len()),
-                None => self.lose(),
+            if let Some(at) = self
+                .window(source_start, name.len())
+                .and_then(|(from, to)| Some((from, unique_match(self.output.get(from..to)?, &needle)?)))
+            {
+                return Some(self.record(source_start, at.0 + at.1, name.len()));
             }
-        } else {
-            self.lose()
+
+            let rest = self.output.get(self.cursor..self.limit)?;
+            unique_match(rest, &needle).map(|at| self.record(source_start, self.cursor + at, name.len()))
+        });
+
+        let mapped = match mapped {
+            Some(mapped) => mapped,
+            None => self.lose(),
         };
 
         // The name's own run just left the cursor sitting right on `<<`, so the
@@ -1405,6 +1416,36 @@ end
         // The value beside it still maps, so the expression is not lost with it.
         let value = source.find("{c}").expect("value") + 1;
         assert!(map.to_output(value).is_some());
+    }
+
+    /// A component reference is not spelled the same way in every backend's
+    /// output — `Row(` for `Table`, `Row,` for `Element`, `Row)(` for
+    /// `Curried` — and a generic instantiation rides along with whichever one
+    /// applies (`Row<<T>>(`, `Row<<T>>,`, `Row<<T>>)(`). Both the name and the
+    /// generic have to map under every one of them, or hover only works for
+    /// whichever backend happened to be tested.
+    #[test]
+    fn a_generic_maps_under_every_backend() {
+        for kind in [
+            luaux::config::BackendKind::Table,
+            luaux::config::BackendKind::Element,
+            luaux::config::BackendKind::Curried,
+        ] {
+            let mut config = Config::with_create("create");
+            config.backend = kind;
+            let source = "local create = f()\nlocal Row = f()\nlocal e = <Row<<string>> each={x}/>\n";
+            let (output, _) = luaux::compile::compile_configured(source, backend(&config), config.clone())
+                .unwrap_or_else(|error| panic!("compile under {kind:?}: {error}"));
+            let map = build(source, &output, &config);
+            assert_round_trips(source, &output, &map);
+
+            assert_eq!(maps_to(source, &output, &map, "Row"), Some("Row"), "name under {kind:?}");
+            assert_eq!(
+                maps_to(source, &output, &map, "string"),
+                Some("string"),
+                "generic under {kind:?}"
+            );
+        }
     }
 
     /// A component tag is emitted as the call it becomes, so its name maps and
