@@ -197,7 +197,27 @@ pub fn path_to_uri(path: &Path) -> String {
     let text = path.to_string_lossy();
 
     #[cfg(windows)]
-    let text = text.replace('\\', "/");
+    let text = {
+        let mut text = text.replace('\\', "/");
+
+        // luau-lsp lowercases a drive letter when it builds a URI from a
+        // filesystem path itself — `Uri::file`, used to resolve a `require`
+        // — but never when parsing one it receives over the wire. Sending it
+        // `C:` here and `c:` there means the same file's `didOpen` and its
+        // own resolved `require` register under two different
+        // `Luau::ModuleName` strings, since that name is a plain,
+        // case-sensitive `std::string` key: the two are never connected, so
+        // a dependency's `didChange` never marks its dependents dirty and
+        // their diagnostics go stale forever. The letter is case-insensitive
+        // on disk regardless, so matching costs nothing.
+        if text.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+            && text.as_bytes().get(1) == Some(&b':')
+        {
+            text.replace_range(0..1, &text[..1].to_ascii_lowercase());
+        }
+
+        text
+    };
 
     let mut out = String::from("file://");
 
@@ -328,8 +348,15 @@ mod tests {
     }
 
     /// What VS Code actually sends on Windows: forward slashes, and the drive
-    /// colon percent-encoded. `path_to_uri` never produces that form, so a
-    /// round-trip through our own encoder cannot catch it.
+    /// colon percent-encoded. `path_to_uri` never produces the percent-encoded
+    /// form, so a round-trip through our own encoder cannot catch that half —
+    /// but it does lowercase the drive letter, matching what luau-lsp's own
+    /// `Uri::file` produces when it resolves a `require` internally. Sending
+    /// it `C:` here and having it compute `c:` there would key the same
+    /// file's `didOpen` and its own resolved dependency edge under two
+    /// different strings, and a dependency's `didChange` would then never
+    /// mark the file requiring it dirty — its diagnostics would go stale and
+    /// never refresh, no matter how many edits followed.
     ///
     /// Deciding the leading slash before decoding leaves `/C:/…`, which is not
     /// a path Windows opens. The symptom is oblique: analysis still answers,
@@ -343,12 +370,24 @@ mod tests {
     fn a_windows_path_becomes_a_uri_with_uri_separators() {
         assert_eq!(
             path_to_uri(Path::new(r"C:\project\build\App.luau")),
-            "file:///C:/project/build/App.luau"
+            "file:///c:/project/build/App.luau"
         );
 
         assert_eq!(
             uri_to_path(&path_to_uri(Path::new(r"C:\My Documents\App.luaux"))),
-            Some(PathBuf::from("C:/My Documents/App.luaux"))
+            Some(PathBuf::from("c:/My Documents/App.luaux"))
+        );
+    }
+
+    /// Only the drive letter is touched — a Windows path is case-insensitive
+    /// there regardless, but not necessarily in the rest of it (a network
+    /// share, or a case-sensitive mount), so nothing else may change.
+    #[test]
+    #[cfg(windows)]
+    fn only_the_drive_letter_is_lowercased() {
+        assert_eq!(
+            path_to_uri(Path::new(r"C:\Users\Maxine\Project.luaux")),
+            "file:///c:/Users/Maxine/Project.luaux"
         );
     }
 
