@@ -25,6 +25,7 @@ pub mod semantic_tokens;
 pub mod server;
 pub mod sourcemap;
 pub mod symbols;
+pub mod synthetic;
 pub mod tree;
 pub mod workspace;
 

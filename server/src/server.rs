@@ -50,12 +50,21 @@ enum Pending {
     ///
     /// Not a `Editor` forward, because none of that applies — the answer is not
     /// remapped but rebuilt, and the range is one we already know.
-    ComponentProps { id: Value, tag: String, range: Value, snippets: bool },
+    ComponentProps { id: Value, tag: String, range: Value, snippets: bool, restore: Restore },
     /// The members of a dotted tag name, rebuilt over the segment the cursor is
     /// in. Same reasoning as [`Pending::ComponentProps`].
-    TagMembers { id: Value, range: Value },
+    TagMembers { id: Value, range: Value, restore: Restore },
     /// The handshake with luau-lsp.
     Initialize,
+}
+
+/// What to put the child back on after answering a question that needed a
+/// synthetic self-close — see [`crate::synthetic`] and [`derive_position`].
+struct Restore {
+    generated: String,
+    /// `None` when nothing was shown to the child in the first place — no
+    /// real compile existed to show it, so there is nothing to put back.
+    output: Option<String>,
 }
 
 pub struct Server {
@@ -474,10 +483,12 @@ impl Server {
             Pending::Editor { id, uri, ours, all_or_nothing } => {
                 self.answer_forwarded(id, &uri, ours, all_or_nothing, body)
             }
-            Pending::ComponentProps { id, tag, range, snippets } => {
-                self.answer_component_props(id, &tag, range, snippets, body)
+            Pending::ComponentProps { id, tag, range, snippets, restore } => {
+                self.answer_component_props(id, &tag, range, snippets, restore, body)
             }
-            Pending::TagMembers { id, range } => self.answer_tag_members(id, range, body),
+            Pending::TagMembers { id, range, restore } => {
+                self.answer_tag_members(id, range, restore, body)
+            }
         }
     }
 
@@ -1492,31 +1503,40 @@ impl Server {
     fn tag_members(&mut self, id: Value, uri: &str, offset: usize, start: usize, prefix: &str) {
         let empty = json!({ "isIncomplete": false, "items": [] });
 
-        let (Some(document), Some(compiled), Some(generated)) =
-            (self.documents.get(uri), self.compiled.get(uri), self.generated_uri(uri))
+        let (Some(document), Some(generated)) = (self.documents.get(uri), self.generated_uri(uri))
         else {
             return self.reply(id, empty);
         };
+        let compiled = self.compiled.get(uri);
 
-        let tags = crate::tree::tree(&document.text);
-        let Some(tag) = crate::tree::innermost_at(&tags, offset) else {
+        let Some(path) = project::uri_to_path(uri) else {
             return self.reply(id, empty);
         };
+        let project_config = self.projects.for_file(&path).config;
 
-        let Some(after_dot) = member_position(&compiled.map, &compiled.output, tag) else {
+        let Some(derived) = derive_position(
+            &document.text,
+            offset,
+            &project_config,
+            compiled,
+            start + prefix.len(),
+            member_position,
+        ) else {
             return self.reply(id, empty);
         };
 
         // Only the segment being typed is replaced. `App.` stays put, so the
         // editor filters what comes back against `Hea` rather than `App.Hea`.
         let range = document.range_at(start + scan::member_offset(prefix), start + prefix.len());
-        let position = LineIndex::new(&compiled.output).position(&compiled.output, after_dot);
+        let position = LineIndex::new(&derived.output).position(&derived.output, derived.inside);
 
         if !self.child_ready {
             return self.reply(id, empty);
         }
 
-        if !self.opened_in_child.contains(&generated) {
+        if derived.synthetic {
+            self.hand_to_child(&generated, &derived.output);
+        } else if !self.opened_in_child.contains(&generated) {
             self.sync_child(uri);
         }
 
@@ -1531,7 +1551,14 @@ impl Server {
 
         match proxy.request("textDocument/completion", request) {
             Ok(child_id) => {
-                self.pending.insert(child_id, Pending::TagMembers { id, range });
+                self.pending.insert(
+                    child_id,
+                    Pending::TagMembers {
+                        id,
+                        range,
+                        restore: Restore { generated, output: derived.restore },
+                    },
+                );
             }
             Err(error) => {
                 self.log(1, &format!("luau-lsp: {error}"));
@@ -1541,8 +1568,12 @@ impl Server {
     }
 
     /// The child's members, as tag names over the segment the cursor is in.
-    fn answer_tag_members(&mut self, id: Value, range: Value, body: Value) {
+    fn answer_tag_members(&mut self, id: Value, range: Value, restore: Restore, body: Value) {
         let empty = json!({ "isIncomplete": false, "items": [] });
+
+        if let Some(real_output) = &restore.output {
+            self.hand_to_child(&restore.generated, real_output);
+        }
 
         if body.get("error").is_some() {
             return self.reply(id, empty);
@@ -1588,34 +1619,44 @@ impl Server {
     ) {
         let empty = json!({ "isIncomplete": false, "items": [] });
 
-        let (Some(document), Some(compiled), Some(generated)) =
-            (self.documents.get(uri), self.compiled.get(uri), self.generated_uri(uri))
+        let (Some(document), Some(generated)) = (self.documents.get(uri), self.generated_uri(uri))
         else {
             return self.reply(id, empty);
         };
+        let compiled = self.compiled.get(uri);
 
-        // The element under the cursor, from the tree rather than the scan: the
-        // name's *offset* is what the map is keyed by, and only the tree has it.
-        let tags = crate::tree::tree(&document.text);
-        let Some(tag) = crate::tree::innermost_at(&tags, offset) else {
+        let Some(path) = project::uri_to_path(uri) else {
             return self.reply(id, empty);
         };
+        let project_config = self.projects.for_file(&path).config;
 
-        let Some(inside) = props_table(&compiled.map, &compiled.output, tag) else {
+        let Some(derived) = derive_position(
+            &document.text,
+            offset,
+            &project_config,
+            compiled,
+            start + prefix.len(),
+            props_table,
+        ) else {
             return self.reply(id, empty);
         };
 
         let range = document.range_at(start, start + prefix.len());
-        let name = tag.name.clone();
-        let position = LineIndex::new(&compiled.output).position(&compiled.output, inside);
+        let position = LineIndex::new(&derived.output).position(&derived.output, derived.inside);
 
         if !self.child_ready {
             return self.reply(id, empty);
         }
 
-        // Same reason as in `forward`: a document the child does not hold cannot
-        // be asked about, and here the refusal would be logged as "no props".
-        if !self.opened_in_child.contains(&generated) {
+        if derived.synthetic {
+            // The child must be shown the patched content before being asked
+            // about it — a tag still open has no call for it in `compiled`
+            // at all, which is exactly why a synthetic close was needed.
+            self.hand_to_child(&generated, &derived.output);
+        } else if !self.opened_in_child.contains(&generated) {
+            // Same reason as in `forward`: a document the child does not hold
+            // cannot be asked about, and here the refusal would be logged as
+            // "no props".
             self.sync_child(uri);
         }
 
@@ -1630,8 +1671,16 @@ impl Server {
 
         match proxy.request("textDocument/completion", request) {
             Ok(child_id) => {
-                self.pending
-                    .insert(child_id, Pending::ComponentProps { id, tag: name, range, snippets });
+                self.pending.insert(
+                    child_id,
+                    Pending::ComponentProps {
+                        id,
+                        tag: derived.tag_name,
+                        range,
+                        snippets,
+                        restore: Restore { generated, output: derived.restore },
+                    },
+                );
             }
             Err(error) => {
                 self.log(1, &format!("luau-lsp: {error}"));
@@ -1647,9 +1696,17 @@ impl Server {
         tag: &str,
         range: Value,
         snippets: bool,
+        restore: Restore,
         body: Value,
     ) {
         let empty = json!({ "isIncomplete": false, "items": [] });
+
+        // Put the child back on the real generated file before anything else,
+        // so an early return here never leaves it answering future questions
+        // about a self-close it never actually had.
+        if let Some(real_output) = &restore.output {
+            self.hand_to_child(&restore.generated, real_output);
+        }
 
         // An error describes the child's condition, not this component. Reading
         // it as "no props" would put a cause on the record that was never
@@ -1924,6 +1981,73 @@ impl Server {
     }
 }
 
+/// Finds the tag at `offset` and asks `lookup` about it — trying a synthetic
+/// self-close if the tag is not there to find at all.
+///
+/// An element still being typed has no closing `>` anywhere yet, which is a
+/// parse error (not the resolution errors `regions`/the compiler recover
+/// from), so [`crate::tree::tree`] simply has no entry for it — that is the
+/// *only* case this reaches for [`crate::synthetic`]. A tag that *is* there
+/// but whose `lookup` still fails (a stale compile behind a rename, say) is
+/// left alone: patching a tag that already has a real closing tag further
+/// down would corrupt it, and "missing beats wrong" already covers that case
+/// correctly without a synthetic attempt.
+///
+/// What asking [`derive_position`] about a tag produced.
+struct Derived {
+    inside: usize,
+    tag_name: String,
+    /// The output `inside` is an offset into — real or synthetic, but always
+    /// present, since a position is meaningless without knowing what it is a
+    /// position *in*.
+    output: String,
+    /// Whether `output` is a synthetic self-close the child must be shown
+    /// outright, rather than reached through the ordinary `sync_child` path.
+    synthetic: bool,
+    /// The real output to put the child back on afterward, when `synthetic`
+    /// and a real compile exists to return to.
+    restore: Option<String>,
+}
+
+/// `compiled` is `None` when the document has never compiled successfully at
+/// all — its very first revision may already be mid-edit — which is exactly
+/// as "nothing to look up against" as a stale one, so it takes the same path.
+fn derive_position(
+    document_text: &str,
+    offset: usize,
+    project_config: &luaux::Config,
+    compiled: Option<&Compiled>,
+    insert_at: usize,
+    lookup: impl Fn(&crate::sourcemap::SourceMap, &str, &crate::tree::Tag) -> Option<usize>,
+) -> Option<Derived> {
+    let real_tags = crate::tree::tree(document_text);
+
+    if let Some(tag) = crate::tree::innermost_at(&real_tags, offset) {
+        let compiled = compiled?;
+        let inside = lookup(&compiled.map, &compiled.output, tag)?;
+        return Some(Derived {
+            inside,
+            tag_name: tag.name.clone(),
+            output: compiled.output.clone(),
+            synthetic: false,
+            restore: None,
+        });
+    }
+
+    let synthetic = crate::synthetic::close_and_compile(document_text, insert_at, project_config)?;
+    let synthetic_tags = crate::tree::tree(&synthetic.source);
+    let tag = crate::tree::innermost_at(&synthetic_tags, offset)?;
+    let inside = lookup(&synthetic.map, &synthetic.output, tag)?;
+
+    Some(Derived {
+        inside,
+        tag_name: tag.name.clone(),
+        output: synthetic.output,
+        synthetic: true,
+        restore: compiled.map(|compiled| compiled.output.clone()),
+    })
+}
+
 /// Where the props table of a component's generated call begins.
 ///
 /// `<Row Name={x}/>` becomes `Row({ Name = x })`, so the question "what may go
@@ -1959,9 +2083,19 @@ fn props_table(
         return None;
     }
 
-    // `Row` then `({`, and nothing between: an intrinsic's `create("Frame")({`
-    // does not reach here, since a class tag name records no run.
-    (output.get(after..after + 2) == Some("({")).then_some(after + 2)
+    // What follows the name differs by backend, exactly as it does for
+    // `map_builder::Builder::component_name`: `table` calls the component
+    // directly (`Row({`), `curried` curries through the factory (`Row)({`),
+    // and `element` passes it as the factory's first argument (`Row, {`).
+    // Rather than plumb the active backend through, every shape is tried in
+    // turn; only the one this compile actually produced can ever match. An
+    // intrinsic's `create("Frame")({` does not reach here at all, since a
+    // class tag name records no run.
+    const SHAPES: [&str; 3] = ["({", ")({", ", {"];
+
+    SHAPES.iter().find_map(|shape| {
+        (output.get(after..after + shape.len()) == Some(*shape)).then_some(after + shape.len())
+    })
 }
 
 /// Where the member of a dotted tag name sits in the generated output.
@@ -2185,6 +2319,211 @@ mod tests {
         assert_eq!(renamed[0].name, "Col");
         assert_eq!(renamed[0].open_name, same[0].open_name);
         assert_eq!(props_table(&map, &output, &renamed[0]), None);
+    }
+
+    /// `props_table` used to assume the `table` backend's shape (`Row({`)
+    /// unconditionally, so a project on `curried` or `element` never got
+    /// component props at all — the tag name was found, but nothing right
+    /// after it ever matched.
+    #[test]
+    fn props_table_finds_the_table_under_every_backend() {
+        use crate::backend;
+        use luaux::config::Config;
+
+        // `curried`: `x(Row)({ ... })`.
+        let curried_config = Config::parse("[factory]\nbackend = \"curried\"\ncreate = \"x\"\n")
+            .expect("config");
+        let curried_source = "local x = f()\nlocal function Row(p) return p end\nlocal e = <Row Name={n} />\n";
+        let (curried_output, _) = luaux::compile::compile_configured(
+            curried_source,
+            backend(&curried_config),
+            curried_config.clone(),
+        )
+        .expect("compile");
+        let curried_map = crate::map_builder::build(curried_source, &curried_output, &curried_config);
+        let curried_tag = crate::tree::tree(curried_source);
+        assert!(props_table(&curried_map, &curried_output, &curried_tag[0]).is_some());
+
+        // `element`: `createElement(Row, { ... })`.
+        let element_config = Config::parse(
+            "[factory]\nbackend = \"element\"\ncreate = \"createElement\"\nfragment = \"Fragment\"\n",
+        )
+        .expect("config");
+        let element_source =
+            "local createElement = f()\nlocal function Row(p) return p end\nlocal e = <Row Name={n} />\n";
+        let (element_output, _) = luaux::compile::compile_configured(
+            element_source,
+            backend(&element_config),
+            element_config.clone(),
+        )
+        .expect("compile");
+        let element_map = crate::map_builder::build(element_source, &element_output, &element_config);
+        let element_tag = crate::tree::tree(element_source);
+        assert!(props_table(&element_map, &element_output, &element_tag[0]).is_some());
+    }
+
+    /// `member_position` anchors only to the tag name's own text run, never
+    /// to what follows it, so it needs no backend-specific handling — this
+    /// pins that it keeps working under backends other than `table`.
+    #[test]
+    fn member_position_is_backend_agnostic() {
+        use crate::backend;
+        use luaux::config::Config;
+
+        let config =
+            Config::parse("[factory]\nbackend = \"curried\"\ncreate = \"x\"\n").expect("config");
+        let source = "local x = f()\nlocal App = f()\nlocal e = <App.Header Name={n} />\n";
+        let (output, _) =
+            luaux::compile::compile_configured(source, backend(&config), config.clone())
+                .expect("compile");
+        let map = crate::map_builder::build(source, &output, &config);
+        let tag = crate::tree::tree(source);
+
+        assert!(member_position(&map, &output, &tag[0]).is_some());
+    }
+
+    /// A tag still being typed (`<Row Na`, no `>` anywhere yet) has no call for
+    /// it in `compiled` at all — an unclosed tag is a parse error, so nothing
+    /// compiled for this revision — but `derive_position` should still find its
+    /// props table via a synthetic self-close.
+    #[test]
+    fn an_unclosed_tag_still_finds_its_props_table_via_synthetic_close() {
+        use crate::backend;
+        use luaux::config::Config;
+
+        let config = Config::with_create("create");
+
+        // What `compiled` holds is from *before* this tag existed, standing in
+        // for the stale fallback `Analysis::run` keeps while a parse error is
+        // in effect.
+        let stale_source = "local create = f()\nlocal function Row(p) return p end\n";
+        let (stale_output, _) =
+            luaux::compile::compile_configured(stale_source, backend(&config), config.clone())
+                .expect("compile");
+        let stale_map = crate::map_builder::build(stale_source, &stale_output, &config);
+        let compiled = Compiled { output: stale_output, map: stale_map, version: 0, lines: 2 };
+
+        let document_text =
+            "local create = f()\nlocal function Row(p) return p end\nlocal e = <Row Na";
+        let offset = document_text.len();
+
+        let derived =
+            derive_position(document_text, offset, &config, Some(&compiled), offset, props_table)
+                .expect("derived via synthetic close");
+
+        assert_eq!(derived.tag_name, "Row");
+        assert!(derived.synthetic);
+        assert!(derived.output[..derived.inside].ends_with("({"), "{}", derived.output);
+    }
+
+    /// A document that has never compiled successfully at all — its very
+    /// first revision is already this unclosed tag — has no `Compiled` to
+    /// pass at all. That is no worse than a stale one for this purpose: the
+    /// synthetic close still finds the props table, and there is simply
+    /// nothing to restore the child to afterward.
+    #[test]
+    fn a_document_with_no_compile_at_all_still_finds_its_props_table() {
+        use luaux::config::Config;
+
+        let config = Config::with_create("create");
+        let document_text =
+            "local create = f()\nlocal function Row(p) return p end\nlocal e = <Row Na";
+        let offset = document_text.len();
+
+        let derived = derive_position(document_text, offset, &config, None, offset, props_table)
+            .expect("derived via synthetic close");
+
+        assert_eq!(derived.tag_name, "Row");
+        assert!(derived.synthetic);
+        assert!(derived.restore.is_none(), "nothing to restore to yet");
+    }
+
+    /// The same, under `curried` — the shape actually hit in practice, where
+    /// both this fix and the backend-shape fix apply together.
+    #[test]
+    fn an_unclosed_tag_still_finds_its_props_table_via_synthetic_close_under_curried() {
+        use crate::backend;
+        use luaux::config::Config;
+
+        let config = Config::parse("[factory]\nbackend = \"curried\"\ncreate = \"x\"\n").expect("config");
+
+        let stale_source = "local x = f()\nlocal function Row(p) return p end\n";
+        let (stale_output, _) =
+            luaux::compile::compile_configured(stale_source, backend(&config), config.clone())
+                .expect("compile");
+        let stale_map = crate::map_builder::build(stale_source, &stale_output, &config);
+        let compiled = Compiled { output: stale_output, map: stale_map, version: 0, lines: 2 };
+
+        let document_text = "local x = f()\nlocal function Row(p) return p end\nlocal e = <Row Na";
+        let offset = document_text.len();
+
+        let derived =
+            derive_position(document_text, offset, &config, Some(&compiled), offset, props_table)
+                .expect("derived via synthetic close");
+
+        assert_eq!(derived.tag_name, "Row");
+        assert!(derived.synthetic);
+        assert!(derived.output[..derived.inside].ends_with(")({"), "{}", derived.output);
+    }
+
+    /// A component that does not resolve at all is still not going to resolve
+    /// once closed — `derive_position` must not manufacture a position for it.
+    /// Missing beats wrong (decision 6), even through the synthetic fallback.
+    #[test]
+    fn an_unresolved_component_still_yields_nothing_once_closed() {
+        use crate::backend;
+        use luaux::config::Config;
+
+        let config = Config::with_create("create");
+
+        let stale_source = "local create = f()\n";
+        let (stale_output, _) =
+            luaux::compile::compile_configured(stale_source, backend(&config), config.clone())
+                .expect("compile");
+        let stale_map = crate::map_builder::build(stale_source, &stale_output, &config);
+        let compiled = Compiled { output: stale_output, map: stale_map, version: 0, lines: 1 };
+
+        let document_text = "local create = f()\nlocal e = <Nope Na";
+        let offset = document_text.len();
+
+        assert!(derive_position(
+            document_text,
+            offset,
+            &config,
+            Some(&compiled),
+            offset,
+            props_table
+        )
+        .is_none());
+    }
+
+    /// A tag that *is* fully closed and parses fine in the current document,
+    /// but whose `props_table` lookup fails because `compiled` is a stale
+    /// revision (the rename case `a_stale_map_does_not_offer_one_components_props_as_anothers`
+    /// pins directly), must **not** fall through to a synthetic close: the
+    /// tag already has a real closing tag further down, and splicing a second
+    /// one in would corrupt it. This is the case decision 6's "missing beats
+    /// wrong" already covers correctly, and `derive_position` must leave it
+    /// alone rather than attempt to paper over it.
+    #[test]
+    fn a_closed_but_stale_mapped_tag_is_not_given_a_synthetic_close() {
+        use crate::backend;
+        use luaux::config::Config;
+
+        let good =
+            "local create = f()\nlocal function Row(p) return p end\nlocal e = <Row Name={n} />\n";
+        let broken = good.replace("<Row Name", "<Col Name");
+
+        let config = Config::with_create("create");
+        let (output, _) =
+            luaux::compile::compile_configured(good, backend(&config), config.clone())
+                .expect("compile");
+        let map = crate::map_builder::build(good, &output, &config);
+        let compiled = Compiled { output, map, version: 0, lines: good.lines().count() };
+
+        let offset = broken.find("Name").unwrap();
+        assert!(derive_position(&broken, offset, &config, Some(&compiled), offset, props_table)
+            .is_none());
     }
 
     #[test]

@@ -598,6 +598,80 @@ local e = <Row />
     assert!(labels.len() < 10, "{labels:?}");
 }
 
+/// A tag still being typed — `<Row Na`, no `>` anywhere yet — is a parse
+/// error, exactly like [`a_file_that_does_not_parse_still_reports_our_own_diagnostic`],
+/// so there is nothing compiled for it at all. Component props still have to
+/// be offered here, via a synthetic self-close asked about on its own, and
+/// answering that question must not leave the child stuck servicing it: a
+/// completion on a real, already-closed tag afterward still has to work.
+#[test]
+fn props_complete_on_a_component_tag_that_is_still_open() {
+    let mut server = server!();
+
+    let unclosed = "\
+local create = nil :: any
+local function Row(props: { Name: string, OnClick: () -> () })
+\treturn create(\"Frame\")(props)
+end
+local e = <Row Na";
+    // No `theirs()` wait here: the file has never compiled successfully (its
+    // very first version is this unclosed tag), so luau-lsp was never handed
+    // anything and has nothing of its own to report yet — completion below is
+    // what actually exercises the synthetic self-close.
+    server.open(unclosed);
+    let _ = server.diagnostics();
+
+    let cursor_line = unclosed.lines().last().expect("a last line");
+    let cursor = cursor_line.len() as u64;
+
+    let mut labels: Vec<String> = Vec::new();
+    for _ in 0..40 {
+        labels = server
+            .completion(4, cursor)
+            .iter()
+            .filter_map(|item| item["label"].as_str())
+            .map(str::to_string)
+            .collect();
+
+        if labels.iter().any(|label| label == "Name") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    assert!(labels.contains(&"Name".to_string()), "unclosed tag: {labels:?}");
+
+    // Close the tag for real, then ask again at the same coordinates
+    // `a_functional_components_props_are_offered_as_attributes` proves good —
+    // the child must have been put back on the real generated file, not left
+    // answering from the synthetic self-close the first question needed.
+    server.change(
+        "\
+local create = nil :: any
+local function Row(props: { Name: string, OnClick: () -> () })
+\treturn create(\"Frame\")(props)
+end
+local e = <Row />
+",
+    );
+    let _ = theirs(&mut server);
+
+    let mut labels_after: Vec<String> = Vec::new();
+    for _ in 0..40 {
+        labels_after = server
+            .completion(4, 15)
+            .iter()
+            .filter_map(|item| item["label"].as_str())
+            .map(str::to_string)
+            .collect();
+
+        if labels_after.iter().any(|label| label == "OnClick") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    assert!(labels_after.contains(&"OnClick".to_string()), "after restore: {labels_after:?}");
+}
+
 /// A table made callable with `__call` is the shape luau-lsp will not infer an
 /// argument type through, so there are no props to offer.
 ///
